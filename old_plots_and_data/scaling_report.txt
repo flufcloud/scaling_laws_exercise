@@ -1,0 +1,71 @@
+(Organize this into a table for comparison)
+Mixture-of-Experts Total Parameter Chinchilla Parameters
+A = 0.6347077488899231, B = 153.87603759765625, E = 0.033697791397571564, alpha = 7.792306423187256, beta = 0.6575875282287598, a = 0.07782198488712311, b = 0.9221780300140381
+
+Mixture-of-Experts Activated Chinchilla Parameters
+A = 380855328.0, B = 794.8629760742188, E = 0.0, alpha = 3.8076770305633545, beta = 0.7996619939804077, a = 0.1735626757144928, b = 0.8264374136924744
+
+Dense Chinchilla Parameters
+A = 9020.7119140625, B = 512.3895263671875, E = 0.0, alpha = 0.7220917344093323, beta = 0.6568683981895447, a = 0.4763505458831787, b = 0.5236494541168213
+
+
+I coded a custom Pallas kernel that fuses the up and down projection for a Mixture-of-Experts style linear layer. The kernel tiles over the final B x D matrix with tiles of B_tile and D_tile, along with F_tiles for accumulation. The kernel imitates ragged_dot's strategy for computing ragged matmuls; in particular, it uses the fact that the maximum number of logical B_blocks required is equal to the number of expert boundaries + the number of physical B_blocks needed to tile over the full B dimension. 
+
+The kernel iterates over a D_blocks x B_blocks x F_blocks grid ie a j x i x k grid where for each iteration, we load the ith B_block x D row from the input, the kth D x F_block column from W_up, and the jth F_block x D_block tile from W_down. The iteration order is designed to exploit how Pallas TPU kernels interact with memory references. For each (j, i), the output reference is fixed for all k, allowing us to safely accumulate into it. However, since we are computing a ragged operation, we have to make j the slowest changing dimension because we may revisit physical blocks with different logical blocks. 
+
+For example, suppose half of the first physical block is routed to Expert 1 and half to Expert 2. Then, for i = 0 and j = 0, we accumulate Expert 1's computation into the output block. If we make i the slowest changing dimension, then assuming our output reference is given (physical(i), j) we write to the (0, 0) output reference, and then the (0, 1) physical reference, and so on. But physical(0) = physical(1), so for i = 1 and j = 0, we revisit the (0, 0) output reference. This overwrites the results of Expert 1's computation (since we cannot read from output buffers in general). 
+
+I conducted 3 experiments to investigate how the fused kernel performs relative to the default unfused operation. For each plot, the ratio between the time taken for fused vs. unfused is plotted on the y-axis (lower indicates the fused operation is better).
+
+{kernel_plot1.png}, with caption 'The x-axis plots the dimension size for each of B, D, and F. Each curve displays how varying the dimension of each parameter influences performance. D and F are not fully plotted along the x-axis due to VMEM constraints. For this experiment, tile sizes for all parameters were fixed.'
+
+{kernel_plot2.png), with caption 'The x-axis plots the tile size for each of B, D, and F. Each curve displays how varying the tile sizes of each parameter influences performance. For this experiment, the dimensions for all parameters were fixed.
+
+{kernel_plot3.png), with caption 'The x-axis plots the number of experts E. Each curve displays how the varying E for specific B influences performance. For this experiment, D, F, and all tile sizes are fixed. 
+
+Takeaways:
+- Decreasing the number of times the fused kernel tiles over D drastically improves the fused vs. unfused ratio. I hypothesize this is because for each tile of D j, we iterate over all k to accumulate into the output tile and consequently load the entire W_up matrix.
+- Increasing B improves the fused vs. unfused ratio. This makes sense because the fused kernel avoids materializing the intermediate B x F projection.
+- Changing the tile sizes of B and F have minimal influence on the fused vs. unfused ratio. I hypothesize this is because the number of tiles for F do not alter the memory traffic, and that for large enough B_tile we are compute bound, so increasing B_tile beyond it does not substantially improve performance. I note however that if B_block is small enough such that it contains rows routed to many different experts, the fused kernel's performance degrades.
+- Increasing the number of experts improves the fused vs. unfused ratio. I found this surprising: when I profiled the code, I discovered that the time taken for an individual up/down projection exceeded the total time taken for the full fused operation. This indicates that ragged_dot incurs overhead per-expert that the fused kernel is avoiding.
+
+Given my analysis, I designed two transformer configurations where I expected the fused kernel to significantly beat the unfused kernel in the forward pass.
+
+Forward Pass Comparison for Fused vs Unfused (make this into a 2 row table, with cols of the various hyper params, and then the last one the achieved times for that specific configuration). For both configs, I used a batch size of 32768, which gives an effective batch size of B * seq_len = 32768 * 16 = 524288
+Config = {
+  'hidden_dim': 256,
+  'mlp_dim': 1024,
+  'attention_dim': 64,
+  'num_qheads': 8,
+  'num_kvheads': 2,
+  'num_layers': 4,
+  'num_experts': 128,
+  'top_k': 1,
+}
+with   'block_sizes': {
+      'b': 256,
+      'd': 256,
+      'f': 256,
+  }, for the custom fused kernel.
+Unfused: 1.85 s ± 172 µs per loop (mean ± std. dev. of 100 runs, 1 loop each)
+Fused: 316 ms ± 131 µs per loop (mean ± std. dev. of 100 runs, 1 loop each)
+Fused Speedup = 16x
+
+Config = {
+  'hidden_dim': 512,
+  'mlp_dim': 2048,
+  'attention_dim': 32,
+  'num_qheads': 4,
+  'num_kvheads': 2,
+  'num_layers': 1,
+  'num_experts': 128,
+  'top_k': 1,
+}
+with   'block_sizes': {
+      'b': 256,
+      'd': 512,
+      'f': 256,
+  }, for the custom fused kernel.
+Unfused 1.6 s ± 2.62 ms per loop (mean ± std. dev. of 100 runs, 1 loop each)
+Fused 105 ms ± 217 µs per loop (mean ± std. dev. of 100 runs, 1 loop each)
+Fused Speedup = 16x
